@@ -1,43 +1,81 @@
 #!/usr/bin/env python3
 """
-build_taisei_switch.py  —  one-shot Taisei (latest, v1.4.5) -> Nintendo Switch .nro
-                           with the SDL3 Switch backend + GLES3 + audio fix.
+build_taisei_switch.py  —  one-shot Taisei (latest, v1.4.5) -> Switch .nro
+                           built on devkitPro's *own* SDL3 Switch backend.
+
+This is the devkitPro variant of the build script. Instead of taking plain
+taisei-project/SDL and bolting neomody77/sdl3-switch's backend onto it (then
+heavily patching that backend), it builds directly against devkitPro's SDL fork:
+
+    https://github.com/devkitPro/SDL/tree/switch-sdl-3.4   (SDL 3.4.0)
+
+That branch ships a complete, maintained libnx backend (video/audio/joystick/
+keyboard/mouse/touch/swkb/filesystem/power/time/timer), so almost none of the
+SDL-side patching the neomody77 build needed applies here. Specifically, the
+following are ALREADY handled natively by devkitPro and were therefore removed:
+
+  * GLES3 context     -- devkitPro's video driver uses SDL's core EGL path
+                         (SDL_EGL_CreateContext_impl / SDL_egl.c), which already
+                         honors the app's SDL_GL_SetAttribute() request, so
+                         Taisei's ES 3.0 ask is granted with no backend patch.
+  * clean exit        -- audren WaitDevice() already returns immediately and the
+                         EGL teardown goes through SDL's standard destroy path;
+                         no finite-wait / neutralized-teardown patch needed.
+  * Nintendo A/B      -- devkitPro's joystick backend already maps face buttons
+                         the swapped Nintendo way (a=1,b=0), matching the old
+                         SDL2 port and Taisei's __SWITCH__ expectations.
+  * EGL link + export -- devkitPro's CMakeLists already does
+                         `sdl_link_dependency(opengl LIBS EGL stdc++ glapi
+                         drm_nouveau)` on the Switch branch, which both links
+                         SDL and writes those libs into sdl3.pc's Libs.private,
+                         so Taisei resolves eglGetDisplay/etc automatically.
+Two SDL-side patches ARE still needed and are applied to the SDL tree before it
+is built:
+  * SDL_egl.h    -- add a __SWITCH__ branch (see below).
+  * audio driver -- devkitPro drives audio through audren (a software mixer).
+                    Its audio-thread work (per-callback update + IPC + render-
+                    frame waits) contends with Taisei's render thread on the
+                    Switch's shared cores and causes frame dips (visible in
+                    handheld, where GPU load matches the old build). We replace
+                    it with the libnx AUDOUT backend (see use_audout_audio_-
+                    backend) -- PCM straight to the hardware sink, the driver the
+                    flawless neomody77 build used -- carrying the proven 4-buffer
+                    cushion + shutdown-aware wait so there is no BGM glitch.
+
+On SDL_egl.h specifically: devkitPro's copy has
+no __SWITCH__ branch in its EGL native-type block, so when Taisei's gles.c includes
+<SDL3/SDL_egl.h> it falls through to `#error "Platform not recognized"`. We add a
+Switch branch (see patch_sdl_egl_switch) before building SDL.
+
+Everything on the *Taisei* side (wallpaper feature + fixes, VFS strfmt/mmap
+bitrot, clean version label, NACP version) is game-side and independent of which
+SDL we use, so it is kept verbatim.
 
 Run this in an empty folder on a Mac/Linux box that already has devkitPro at
 /opt/devkitpro with the Switch portlibs installed (mesa, freetype, libpng, webp,
 zstd, opus/ogg/opusfile, cglm, libzip, zlib) plus meson + ninja + cmake.
 
 It will:
-  1. clone taisei-project/SDL @ taisei-3.4.10 (the SDL3 fork Taisei v1.4.5 uses)
-  2. apply neomody77/sdl3-switch's backend  (video/audio/joystick for libnx)
-  3. adapt the video backend for OpenGL ES 3.0 (Taisei needs ES3, the backend
-     shipped ES2-only) and fix the audio backend's BGM glitch: 2->4 buffers
-     plus a non-blocking drain so WaitDevice() doesn't re-synchronize with
-     the hardware after every single buffer
-  4. apply three more Switch fixes:
-       * clean version label   -- .VERSION override so it reads "1.4.5" and not
-         "1.4.5-dirty-<branch>" (we patch the tree, which makes git dirty)
-       * Nintendo A/B buttons  -- remap the joystick backend so menus use
-         A = accept, B = cancel (the stock backend maps them Xbox-style)
-       * clean exit            -- make the audio thread's wait finite and
-         shutdown-aware so it doesn't deadlock the shutdown join (which caused
-         "The software was closed because an error occurred")
-  5. cmake-build that SDL3 static and install it into your Switch portlibs
-  6. clone taisei @ v1.4.5 (recursive) and meson/ninja-build the .nro
-  7. drop the finished taisei.nro (+ SD-card layout) in ./dist/
+  1. clone devkitPro/SDL @ switch-sdl-3.4 (SDL 3.4.0, full libnx backend)
+  2. cmake-build that SDL3 static and install it into your Switch portlibs
+     (its sdl3.pc exports the mesa EGL deps for downstream linking)
+  3. clone taisei @ v1.4.5 (recursive); it picks up the installed SDL 3.4.0 via
+     pkg-config (satisfies its `sdl3 >= 3.2.0` requirement, no fallback wrap)
+  4. apply the Taisei-side Switch fixes (wallpaper, VFS bitrot, version labels)
+  5. meson/ninja-build the .nro
+  6. drop the finished taisei.nro (+ SD-card layout) in ./dist/
 
 Usage:
-    python3 build_taisei_switch.py [--workdir DIR] [--jobs N] [--clean]
+    python3 build_taisei_switch_devkitpro.py [--workdir DIR] [--jobs N] [--clean]
     DEVKITPRO=/opt/devkitpro is assumed; override with --devkitpro or $DEVKITPRO.
 """
 
 import argparse, os, re, shutil, subprocess, sys, textwrap
 from pathlib import Path
 
-TAISEI_TAG = "v1.4.5"
-SDL_REPO   = "https://github.com/taisei-project/SDL"
-SDL_BRANCH = "taisei-3.4.10"
-SDL3SWITCH = "https://github.com/neomody77/sdl3-switch"
+TAISEI_TAG  = "v1.4.5"
+SDL_REPO    = "https://github.com/devkitPro/SDL"
+SDL_BRANCH  = "switch-sdl-3.4"
 TAISEI_REPO = "https://github.com/taisei-project/taisei"
 
 def c(s, code):  # tiny color helper
@@ -66,274 +104,346 @@ def bash_capture(script, devkitpro):
                           capture_output=True, text=True).stdout.strip()
 
 # ---------------------------------------------------------------------------
-# The GLES3 video adaptation (identical logic to adapt_video_gles3.py)
+# The SDL-side patches devkitPro's tree still needs (headers + audio cushion).
 # ---------------------------------------------------------------------------
-def adapt_video_gles3(path: Path):
-    src = path.read_text()
-    if "EGL_OPENGL_ES3_BIT_KHR" in src:
-        info("video backend already ES3-adapted"); return
-
-    anchor = "#include <switch.h>\n"
+def patch_sdl_egl_switch(sdl_root):
+    """devkitPro's bundled SDL_egl.h has no branch for the Switch: its native-type
+    typedef chain falls through to `#else / #error "Platform not recognized"`.
+    SDL itself dodges this (its switch backend pulls the native types in another
+    way), but when Taisei's src/renderer/glescommon/gles.c includes <SDL3/SDL_egl.h>
+    it takes the builtin-definitions path and hits the #error, then errors again on
+    every EGLNativeDisplayType/PixmapType/WindowType use. Add a __SWITCH__ branch
+    (same shape as the __unix__/__Fuchsia__ branches) so the native types resolve.
+    Applied to the SDL source tree *before* build+install, so the installed
+    portlibs header carries the fix."""
+    egl = sdl_root / "include/SDL3/SDL_egl.h"
+    if not egl.exists():
+        info("SDL_egl.h not found; skipping switch EGL fix"); return
+    src = egl.read_text()
+    if "defined(__SWITCH__)" in src:
+        info("SDL_egl.h already has a Switch case"); return
+    anchor = '#else\n#error "Platform not recognized"'
     if anchor not in src:
-        die("anchor '#include <switch.h>' not found in SDL_switchvideo.c")
-    src = src.replace(anchor, anchor + textwrap.dedent("""
-        #ifndef EGL_OPENGL_ES3_BIT_KHR
-        #define EGL_OPENGL_ES3_BIT_KHR 0x00000040
-        #endif
-        #ifndef EGL_CONTEXT_MAJOR_VERSION_KHR
-        #define EGL_CONTEXT_MAJOR_VERSION_KHR 0x3098
-        #endif
-        #ifndef EGL_CONTEXT_MINOR_VERSION_KHR
-        #define EGL_CONTEXT_MINOR_VERSION_KHR 0x30FB
-        #endif
-    """), 1)
+        info("SDL_egl.h platform block not in expected form; skipping"); return
+    branch = ('#elif defined(__SWITCH__)\n\n'
+              'typedef void             *EGLNativeDisplayType;\n'
+              'typedef khronos_uintptr_t EGLNativePixmapType;\n'
+              'typedef khronos_uintptr_t EGLNativeWindowType;\n\n'
+              '#else\n#error "Platform not recognized"')
+    egl.write_text(src.replace(anchor, branch, 1))
+    info("SDL_egl.h: added Switch EGL native types (fixes Taisei gles.c #error)")
 
-    old_attrs = (
-        "    static const EGLint config_attrs[] = {\n"
-        "        EGL_RED_SIZE, 8,\n"
-        "        EGL_GREEN_SIZE, 8,\n"
-        "        EGL_BLUE_SIZE, 8,\n"
-        "        EGL_ALPHA_SIZE, 8,\n"
-        "        EGL_DEPTH_SIZE, 24,\n"
-        "        EGL_STENCIL_SIZE, 8,\n"
-        "        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,\n"
-        "        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,\n"
-        "        EGL_NONE\n"
-        "    };\n"
-        "    static const EGLint context_attrs[] = {\n"
-        "        EGL_CONTEXT_CLIENT_VERSION, 2,\n"
-        "        EGL_NONE\n"
-        "    };"
-    )
-    new_attrs = textwrap.dedent("""\
-        // Honor the GL version/attributes the application requested via
-        // SDL_GL_SetAttribute(). Taisei asks for an OpenGL ES 3.0 context and
-        // refuses anything below ES 3.0.
-            const int req_major = (_this->gl_config.major_version > 0) ? _this->gl_config.major_version : 2;
-            const int req_minor = _this->gl_config.minor_version;
-            const EGLint renderable = (req_major >= 3) ? EGL_OPENGL_ES3_BIT_KHR : EGL_OPENGL_ES2_BIT;
-            const int c_red   = (_this->gl_config.red_size   > 0) ? _this->gl_config.red_size   : 8;
-            const int c_green = (_this->gl_config.green_size > 0) ? _this->gl_config.green_size : 8;
-            const int c_blue  = (_this->gl_config.blue_size  > 0) ? _this->gl_config.blue_size  : 8;
-            const int c_alpha = (_this->gl_config.alpha_size > 0) ? _this->gl_config.alpha_size : 8;
-            const int c_depth = (_this->gl_config.depth_size > 0) ? _this->gl_config.depth_size : 24;
-            const int c_stencil = _this->gl_config.stencil_size;
 
-            const EGLint config_attrs[] = {
-                EGL_RED_SIZE, c_red,
-                EGL_GREEN_SIZE, c_green,
-                EGL_BLUE_SIZE, c_blue,
-                EGL_ALPHA_SIZE, c_alpha,
-                EGL_DEPTH_SIZE, c_depth,
-                EGL_STENCIL_SIZE, c_stencil,
-                EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-                EGL_RENDERABLE_TYPE, renderable,
-                EGL_NONE
-            };
-            EGLint context_attrs[] = {
-                EGL_CONTEXT_MAJOR_VERSION_KHR, req_major,
-                EGL_CONTEXT_MINOR_VERSION_KHR, req_minor,
-                EGL_NONE
-            };""")
-    if old_attrs not in src:
-        die("could not find the ES2 attribute block to replace (backend changed upstream?)")
-    src = src.replace(old_attrs, new_attrs)
+SWITCH_AUDOUT_H = r'''/*
+  Simple DirectMedia Layer
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
 
-    old_ctx = (
-        "    v->context = eglCreateContext(v->display, v->config, EGL_NO_CONTEXT, context_attrs);\n"
-        "    if (v->context == EGL_NO_CONTEXT) {\n"
-        '        SDL_SetError("eglCreateContext() failed: %d", eglGetError());\n'
-        "        goto error;\n"
-        "    }"
-    )
-    new_ctx = (
-        "    v->context = eglCreateContext(v->display, v->config, EGL_NO_CONTEXT, context_attrs);\n"
-        "    if (v->context == EGL_NO_CONTEXT) {\n"
-        "        // Fallback for EGL without EGL_KHR_create_context.\n"
-        "        EGLint fallback_attrs[] = { EGL_CONTEXT_CLIENT_VERSION, req_major, EGL_NONE };\n"
-        "        v->context = eglCreateContext(v->display, v->config, EGL_NO_CONTEXT, fallback_attrs);\n"
-        "    }\n"
-        "    if (v->context == EGL_NO_CONTEXT) {\n"
-        '        SDL_SetError("eglCreateContext() failed: %d", eglGetError());\n'
-        "        goto error;\n"
-        "    }"
-    )
-    if old_ctx not in src:
-        die("could not find the eglCreateContext block to add the fallback")
-    src = src.replace(old_ctx, new_ctx)
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
 
-    path.write_text(src)
-    info("video backend adapted for OpenGL ES 3.x")
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
 
-def fix_audio_backend(header_path: Path, source_path: Path):
-    """neomody77/sdl3-switch's stock AUDOUT driver is lockstep: PlayDevice()
-    submits one buffer, and WaitDevice() unconditionally blocks on
-    audoutWaitPlayFinish() every call. Merely bumping NUM_AUDIO_BUFFERS 2->4
-    (the old fix) doesn't change that -- the ring is still only ever one
-    buffer deep in practice, so any frame-time hitch on the audio thread
-    still drains straight through to an audible BGM glitch, same as v1.4.2's
-    stock 2-buffer SDL2 driver had.
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+*/
+#ifndef SDL_switchaudio_h_
+#define SDL_switchaudio_h_
 
-    This applies the real fix (mirrors the v1.4.2 SDL2/audren fix, adapted to
-    libnx's plain AUDOUT API):
-      1. Raise the ring from 2 to 4 buffers.
-      2. Track buffers submitted-but-not-yet-released in `queued`.
-      3. WaitDevice() first does a non-blocking drain via
-         audoutGetReleasedAudioOutBuffer() (a plain IPC call, not a wait) to
-         reclaim anything already finished, then returns immediately if the
-         ring still has room -- letting the mixer thread get ahead and build
-         a real cushion. It only blocks on audoutWaitPlayFinish() once the
-         ring is actually full.
-    """
-    h = header_path.read_text()
-    if "int queued;" not in h:
-        h2 = h.replace("#define NUM_AUDIO_BUFFERS 2", "#define NUM_AUDIO_BUFFERS 4")
-        if "#define NUM_AUDIO_BUFFERS 4" not in h2:
-            die("could not find 'NUM_AUDIO_BUFFERS 2' to bump in SDL_switchaudio.h")
-        anchor = "    int next;                                  // next pool slot to submit\n"
-        if anchor not in h2:
-            die("SDL_switchaudio.h: 'next' field line not found in expected form")
-        h2 = h2.replace(
-            anchor,
-            anchor + "    int queued;                                // buffers submitted to AUDOUT, not yet released\n",
-            1,
-        )
-        header_path.write_text(h2)
-        info("SDL_switchaudio.h: 2->4 buffers + added in-flight queue counter")
-    else:
-        info("SDL_switchaudio.h: audio fix already applied")
+#include "SDL_internal.h"
+#include "../SDL_sysaudio.h"
 
-    c_src = source_path.read_text()
-    changed = False
+#include <switch.h>
 
-    if "device->hidden->queued = 0;" not in c_src:
-        anchor = "    device->hidden->next = 0;\n"
-        if anchor not in c_src:
-            die("SDL_switchaudio.c: 'next = 0' init line not found")
-        c_src = c_src.replace(anchor, anchor + "    device->hidden->queued = 0;\n", 1)
-        changed = True
+#define NUM_AUDIO_BUFFERS 4
 
-    if "device->hidden->queued++;" not in c_src:
-        old_play = (
-            '    if (R_FAILED(audoutAppendAudioOutBuffer(b))) {\n'
-            '        return SDL_SetError("audoutAppendAudioOutBuffer() failed");\n'
-            '    }\n'
-            '    return true;\n'
-            '}\n'
-        )
-        new_play = (
-            '    if (R_FAILED(audoutAppendAudioOutBuffer(b))) {\n'
-            '        return SDL_SetError("audoutAppendAudioOutBuffer() failed");\n'
-            '    }\n'
-            '    device->hidden->queued++;\n'
-            '    return true;\n'
-            '}\n'
-        )
-        if old_play not in c_src:
-            die("SDL_switchaudio.c: PlayDevice body not in expected form")
-        c_src = c_src.replace(old_play, new_play, 1)
-        changed = True
+struct SDL_PrivateAudioData
+{
+    Uint8 *mixbuf;                            // buffer SDL fills each iteration
+    AudioOutBuffer buffers[NUM_AUDIO_BUFFERS]; // libnx AUDOUT buffer pool
+    int next;                                  // next pool slot to submit
+    int queued;                                // buffers submitted to AUDOUT, not yet released
+};
 
-    if "SWITCHAUDIO_DrainReleased" not in c_src:
-        old_wait = (
-            'static bool SWITCHAUDIO_WaitDevice(SDL_AudioDevice *device)\n'
-            '{\n'
-            '    AudioOutBuffer *released = NULL;\n'
-            '    u32 released_count = 0;\n'
-            '    (void)device;\n'
-            '    if (R_FAILED(audoutWaitPlayFinish(&released, &released_count, UINT64_MAX))) {\n'
-            '        return SDL_SetError("audoutWaitPlayFinish() failed");\n'
-            '    }\n'
-            '    return true;\n'
-            '}\n'
-        )
-        new_wait = textwrap.dedent('''\
-            // Reclaim any buffers the hardware has already finished with,
-            // without blocking. audoutGetReleasedAudioOutBuffer() is a plain
-            // (non-blocking) IPC call; each successful call reports at most
-            // one released buffer, so drain in a loop until it reports none.
-            static void SWITCHAUDIO_DrainReleased(SDL_AudioDevice *device)
-            {
-                AudioOutBuffer *released = NULL;
-                u32 released_count = 0;
-                for (;;) {
-                    released_count = 0;
-                    if (R_FAILED(audoutGetReleasedAudioOutBuffer(&released, &released_count))) {
-                        break;
-                    }
-                    if (!released_count) {
-                        break;
-                    }
-                    if (device->hidden->queued > 0) {
-                        device->hidden->queued--;
-                    }
-                }
+#endif // SDL_switchaudio_h_
+'''
+
+SWITCH_AUDOUT_C = r'''/*
+  Simple DirectMedia Layer
+  Copyright (C) 1997-2026 Sam Lantinga <slouken@libsdl.org>
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+*/
+#include "SDL_internal.h"
+
+#ifdef SDL_AUDIO_DRIVER_SWITCH
+
+#include "../SDL_sysaudio.h"
+#include "SDL_switchaudio.h"
+
+#include <malloc.h> // memalign
+#include <switch.h>
+
+#define SWITCHAUDIO_DRIVER_NAME "switch"
+
+// libnx AUDOUT requires 0x1000-aligned buffers and sizes.
+#define SWITCH_AUDIO_ALIGN 0x1000
+#define ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((u64)(a) - 1))
+
+static bool SWITCHAUDIO_OpenDevice(SDL_AudioDevice *device)
+{
+    bool audout_inited = false;
+    bool audout_started = false;
+    u64 aligned;
+    int i;
+
+    device->hidden = (struct SDL_PrivateAudioData *)SDL_calloc(1, sizeof(*device->hidden));
+    if (!device->hidden) {
+        return false;
+    }
+
+    // AUDOUT is fixed at 48000 Hz, 2 channels, signed 16-bit little-endian.
+    device->spec.freq = 48000;
+    device->spec.channels = 2;
+    device->spec.format = SDL_AUDIO_S16LE;
+    SDL_UpdatedAudioDeviceFormat(device);
+
+    if (R_FAILED(audoutInitialize())) {
+        SDL_SetError("audoutInitialize() failed");
+        goto failed;
+    }
+    audout_inited = true;
+
+    if (R_FAILED(audoutStartAudioOut())) {
+        SDL_SetError("audoutStartAudioOut() failed");
+        goto failed;
+    }
+    audout_started = true;
+
+    aligned = ALIGN_UP((u64)device->buffer_size, SWITCH_AUDIO_ALIGN);
+    for (i = 0; i < NUM_AUDIO_BUFFERS; i++) {
+        void *mem = memalign(SWITCH_AUDIO_ALIGN, aligned);
+        if (!mem) {
+            SDL_SetError("Out of memory allocating AUDOUT buffer");
+            goto failed;
+        }
+        SDL_memset(mem, 0, aligned);
+        device->hidden->buffers[i].next = NULL;
+        device->hidden->buffers[i].buffer = mem;
+        device->hidden->buffers[i].buffer_size = aligned;
+        device->hidden->buffers[i].data_size = device->buffer_size;
+        device->hidden->buffers[i].data_offset = 0;
+    }
+
+    device->hidden->mixbuf = (Uint8 *)SDL_malloc(device->buffer_size);
+    if (!device->hidden->mixbuf) {
+        goto failed;
+    }
+    SDL_memset(device->hidden->mixbuf, device->silence_value, device->buffer_size);
+    device->hidden->next = 0;
+    device->hidden->queued = 0;
+
+    return true;
+
+failed:
+    // Unwind any partial initialization so the device can be reopened cleanly.
+    for (i = 0; i < NUM_AUDIO_BUFFERS; i++) {
+        if (device->hidden->buffers[i].buffer) {
+            free(device->hidden->buffers[i].buffer); // memalign() pairs with free()
+            device->hidden->buffers[i].buffer = NULL;
+        }
+    }
+    if (device->hidden->mixbuf) {
+        SDL_free(device->hidden->mixbuf);
+        device->hidden->mixbuf = NULL;
+    }
+    if (audout_started) {
+        audoutStopAudioOut();
+    }
+    if (audout_inited) {
+        audoutExit();
+    }
+    SDL_free(device->hidden);
+    device->hidden = NULL;
+    return false;
+}
+
+static Uint8 *SWITCHAUDIO_GetDeviceBuf(SDL_AudioDevice *device, int *buffer_size)
+{
+    (void)buffer_size;
+    return device->hidden->mixbuf;
+}
+
+static bool SWITCHAUDIO_PlayDevice(SDL_AudioDevice *device, const Uint8 *buffer, int buflen)
+{
+    AudioOutBuffer *b = &device->hidden->buffers[device->hidden->next];
+
+    SDL_memcpy(b->buffer, buffer, buflen);
+    b->data_size = (u64)buflen;
+    device->hidden->next = (device->hidden->next + 1) % NUM_AUDIO_BUFFERS;
+
+    if (R_FAILED(audoutAppendAudioOutBuffer(b))) {
+        return SDL_SetError("audoutAppendAudioOutBuffer() failed");
+    }
+    device->hidden->queued++;
+    return true;
+}
+
+// Reclaim any buffers the hardware has already finished with,
+// without blocking. audoutGetReleasedAudioOutBuffer() is a plain
+// (non-blocking) IPC call; each successful call reports at most
+// one released buffer, so drain in a loop until it reports none.
+static void SWITCHAUDIO_DrainReleased(SDL_AudioDevice *device)
+{
+    AudioOutBuffer *released = NULL;
+    u32 released_count = 0;
+    for (;;) {
+        released_count = 0;
+        if (R_FAILED(audoutGetReleasedAudioOutBuffer(&released, &released_count))) {
+            break;
+        }
+        if (!released_count) {
+            break;
+        }
+        if (device->hidden->queued > 0) {
+            device->hidden->queued--;
+        }
+    }
+}
+
+static bool SWITCHAUDIO_WaitDevice(SDL_AudioDevice *device)
+{
+    AudioOutBuffer *released = NULL;
+    u32 released_count = 0;
+
+    // Drain what's already finished first, at no cost.
+    SWITCHAUDIO_DrainReleased(device);
+
+    // Ring still has room: return immediately (PlayDevice must not
+    // block anyway -- see SDL_audio.c). This lets the mixer thread
+    // get ahead of playback and build a cushion of queued buffers,
+    // instead of re-synchronizing with the hardware after every
+    // single buffer (which is what made a frame hitch on the
+    // audio thread turn into an audible BGM glitch).
+    if (device->hidden->queued < NUM_AUDIO_BUFFERS) {
+        return true;
+    }
+
+    // Ring is full: block until the hardware frees a slot, but wake up
+    // periodically so we can observe a shutdown request. A queued buffer
+    // may never be released once playback is stopping at teardown, so an
+    // unbounded wait here deadlocks the SDL_WaitThread() join in
+    // ClosePhysicalAudioDevice() -- the app then hangs on exit and the
+    // system reports "software closed because an error occurred".
+    while (!SDL_GetAtomicInt(&device->shutdown)) {
+        released = NULL;
+        released_count = 0;
+        if (R_SUCCEEDED(audoutWaitPlayFinish(&released, &released_count, 100000000ULL))) {
+            if (released_count > (u32)device->hidden->queued) {
+                device->hidden->queued = 0;
+            } else {
+                device->hidden->queued -= (int)released_count;
             }
+            break;
+        }
+        // timed out with nothing released: loop and re-check shutdown
+    }
+    return true;
+}
 
-            static bool SWITCHAUDIO_WaitDevice(SDL_AudioDevice *device)
-            {
-                AudioOutBuffer *released = NULL;
-                u32 released_count = 0;
+static void SWITCHAUDIO_CloseDevice(SDL_AudioDevice *device)
+{
+    if (!device->hidden) {
+        return;
+    }
 
-                // Drain what's already finished first, at no cost.
-                SWITCHAUDIO_DrainReleased(device);
+    audoutStopAudioOut();
+    audoutExit();
 
-                // Ring still has room: return immediately (PlayDevice must not
-                // block anyway -- see SDL_audio.c). This lets the mixer thread
-                // get ahead of playback and build a cushion of queued buffers,
-                // instead of re-synchronizing with the hardware after every
-                // single buffer (which is what made a frame hitch on the
-                // audio thread turn into an audible BGM glitch).
-                if (device->hidden->queued < NUM_AUDIO_BUFFERS) {
-                    return true;
-                }
+    for (int i = 0; i < NUM_AUDIO_BUFFERS; i++) {
+        if (device->hidden->buffers[i].buffer) {
+            free(device->hidden->buffers[i].buffer); // memalign() pairs with free()
+            device->hidden->buffers[i].buffer = NULL;
+        }
+    }
+    if (device->hidden->mixbuf) {
+        SDL_free(device->hidden->mixbuf);
+        device->hidden->mixbuf = NULL;
+    }
+    SDL_free(device->hidden);
+    device->hidden = NULL;
+}
 
-                // Ring is full: block until the hardware frees a slot.
-                if (R_FAILED(audoutWaitPlayFinish(&released, &released_count, UINT64_MAX))) {
-                    return SDL_SetError("audoutWaitPlayFinish() failed");
-                }
-                if (released_count > (u32)device->hidden->queued) {
-                    device->hidden->queued = 0;
-                } else {
-                    device->hidden->queued -= (int)released_count;
-                }
-                return true;
-            }
-        ''')
-        if old_wait not in c_src:
-            die("SDL_switchaudio.c: WaitDevice body not in expected form")
-        c_src = c_src.replace(old_wait, new_wait, 1)
-        changed = True
+static bool SWITCHAUDIO_Init(SDL_AudioDriverImpl *impl)
+{
+    impl->OpenDevice = SWITCHAUDIO_OpenDevice;
+    impl->GetDeviceBuf = SWITCHAUDIO_GetDeviceBuf;
+    impl->PlayDevice = SWITCHAUDIO_PlayDevice;
+    impl->WaitDevice = SWITCHAUDIO_WaitDevice;
+    impl->CloseDevice = SWITCHAUDIO_CloseDevice;
+    impl->OnlyHasDefaultPlaybackDevice = true;
+    impl->HasRecordingSupport = false;
+    return true;
+}
 
-    if changed:
-        source_path.write_text(c_src)
-        info("SDL_switchaudio.c: non-blocking drain + cushioned WaitDevice applied")
-    else:
-        info("SDL_switchaudio.c: audio fix already applied")
+AudioBootStrap SWITCHAUDIO_bootstrap = {
+    SWITCHAUDIO_DRIVER_NAME,
+    "SDL Nintendo Switch (libnx AUDOUT) audio driver",
+    SWITCHAUDIO_Init,
+    false,
+    false
+};
 
-# ---------------------------------------------------------------------------
-def patch_sdl_cmake_egl_link(sdl_root):
-    """SDL's Switch CMake block adds EGL/GLES *headers* but never links libEGL,
-    so sdl3.pc doesn't tell downstream apps (Taisei) to link it -> undefined
-    eglGetDisplay/etc at final link. Add the mesa EGL libs as a link dependency,
-    which sdl_link_dependency also writes into sdl3.pc's Libs.private."""
-    cml = sdl_root / "CMakeLists.txt"
-    if not cml.exists():
-        info("SDL CMakeLists.txt not found; skipping EGL link fix"); return
-    t = cml.read_text()
-    if "sdl_link_dependency(switch_egl" in t:
-        info("SDL CMake: EGL link dependency already present"); return
-    anchor = ('    sdl_include_directories(PRIVATE SYSTEM "$ENV{DEVKITPRO}/portlibs/switch/include")\n'
-              '    set(HAVE_SDL_VIDEO TRUE)')
-    if anchor not in t:
-        info("SDL CMake: switch video block not in expected form; skipping"); return
-    repl = ('    sdl_include_directories(PRIVATE SYSTEM "$ENV{DEVKITPRO}/portlibs/switch/include")\n'
-            '    # switch-mesa EGL + its static deps must be on the link line and exported\n'
-            '    # via sdl3.pc so downstream apps (Taisei) resolve eglGetDisplay/etc.\n'
-            '    sdl_link_dependency(switch_egl LIBS EGL glapi drm_nouveau)\n'
-            '    set(HAVE_SDL_VIDEO TRUE)')
-    cml.write_text(t.replace(anchor, repl, 1))
-    info("SDL CMake: added EGL link dependency (EGL glapi drm_nouveau)")
+#endif // SDL_AUDIO_DRIVER_SWITCH
+'''
+
+def use_audout_audio_backend(sdl_root):
+    """Replace devkitPro's audren audio backend with the libnx AUDOUT backend.
+
+    devkitPro drives audio through audren (a software mixer whose SDL glue runs
+    an extra per-callback update/IPC and waits on its own render frames). On the
+    Switch's shared cores that audio-thread work periodically contends with
+    Taisei's render thread and shows up as frame dips (most visible in handheld,
+    where the GPU load is otherwise identical to the old build). AUDOUT instead
+    hands PCM straight to the hardware sink with almost no game-side threading --
+    the same driver the neomody77 build used, which profiled cleanly.
+
+    We overwrite src/audio/switch/SDL_switchaudio.{c,h} with the AUDOUT backend
+    (same file names, same SWITCHAUDIO_bootstrap symbol and \"switch\" driver
+    name, so devkitPro's CMake picks it up with no build changes; audout lives
+    in libnx, already linked via -lnx). The embedded backend already carries the
+    proven fixes from the flawless build: a 4-deep buffer ring with a
+    non-blocking drain in WaitDevice() (so the mixer keeps a cushion instead of
+    re-synchronizing every buffer -> no BGM glitch), and a finite, shutdown-
+    aware wait (so the audio thread can't deadlock the shutdown join)."""
+    adir = sdl_root / "src/audio/switch"
+    if not adir.exists():
+        die("SDL audio/switch dir not found; cannot install AUDOUT backend")
+    (adir / "SDL_switchaudio.h").write_text(SWITCH_AUDOUT_H)
+    (adir / "SDL_switchaudio.c").write_text(SWITCH_AUDOUT_C)
+    info("switch audio: replaced audren backend with libnx AUDOUT "
+         "(4-buffer cushion + shutdown-aware wait; avoids audren frame dips)")
 
 
 def fix_wallpaper_draw(taisei_root):
@@ -1057,34 +1167,13 @@ def patch_taisei_switch_source(taisei_root):
         t = cf.read_text()
         if "-lEGL" not in t:
             old = 'ADDITIONAL_LINK_FLAGS="-specs=$DEVKITPRO/libnx/switch.specs"'
-            new = 'ADDITIONAL_LINK_FLAGS="-specs=$DEVKITPRO/libnx/switch.specs -lEGL -lglapi -ldrm_nouveau"'
+            new = 'ADDITIONAL_LINK_FLAGS="-specs=$DEVKITPRO/libnx/switch.specs -lEGL -lstdc++ -lglapi -ldrm_nouveau"'
             if old not in t:
                 die("switch/crossfile.sh: ADDITIONAL_LINK_FLAGS line not found")
             cf.write_text(t.replace(old, new, 1))
             info("switch/crossfile.sh: added mesa EGL to link flags")
         else:
             info("switch/crossfile.sh: EGL link flags already present")
-
-
-def patch_sdl_egl_switch(sdl_root):
-    """SDL's bundled SDL_egl.h has no case for the Switch, so it #errors on the
-    EGL native types when Taisei's gles.c includes it. Add a __SWITCH__ branch."""
-    egl = sdl_root / "include/SDL3/SDL_egl.h"
-    if not egl.exists():
-        info("SDL_egl.h not found; skipping switch EGL fix"); return
-    src = egl.read_text()
-    if "defined(__SWITCH__)" in src:
-        info("SDL_egl.h already has a Switch case"); return
-    anchor = '#else\n#error "Platform not recognized"'
-    if anchor not in src:
-        info("SDL_egl.h platform block not in expected form; skipping"); return
-    branch = ('#elif defined(__SWITCH__)\n\n'
-              'typedef void             *EGLNativeDisplayType;\n'
-              'typedef khronos_uintptr_t EGLNativePixmapType;\n'
-              'typedef khronos_uintptr_t EGLNativeWindowType;\n\n'
-              '#else\n#error "Platform not recognized"')
-    egl.write_text(src.replace(anchor, branch, 1))
-    info("SDL_egl.h: added Switch EGL native types")
 
 
 def ensure_pack_deps():
@@ -1112,84 +1201,6 @@ def ensure_pack_deps():
             run([py, "-m", "pip", "install", "--quiet", "backports.zstd"])
         except subprocess.CalledProcessError:
             run([py, "-m", "pip", "install", "--quiet", "--user", "backports.zstd"])
-
-
-def fix_video_clean_exit(video_path):
-    """On Switch, mesa/nouveau EGL teardown (eglDestroyContext/eglDestroySurface/
-    eglTerminate) can deadlock the GPU channel during shutdown. Taisei runs this
-    only at process exit and never recreates the context (fullscreen-only), so the
-    graceful teardown buys nothing but a hang -- the app never reaches
-    appletUnlockExit() and the system reports 'software closed because an error
-    occurred'. Drop our EGL handles and let the kernel reclaim the GPU on exit."""
-    t = video_path.read_text()
-    if "let the kernel reclaim the GPU" in t:
-        info("SDL_switchvideo.c: clean-exit teardown already applied"); return
-
-    old_unload = (
-        "static void SWITCH_GL_UnloadLibrary(SDL_VideoDevice *_this)\n"
-        "{\n"
-        "    SDL_VideoData *v = _this->internal;\n"
-        "    if (v && v->display != EGL_NO_DISPLAY) {\n"
-        "        eglTerminate(v->display);\n"
-        "        v->display = EGL_NO_DISPLAY;\n"
-        "    }\n"
-        "}"
-    )
-    new_unload = (
-        "static void SWITCH_GL_UnloadLibrary(SDL_VideoDevice *_this)\n"
-        "{\n"
-        "    SDL_VideoData *v = _this->internal;\n"
-        "    // Skip mesa/nouveau eglTerminate(): it can hang the GPU channel on\n"
-        "    // exit. Just forget the handle and let the kernel reclaim the GPU.\n"
-        "    if (v) {\n"
-        "        v->display = EGL_NO_DISPLAY;\n"
-        "    }\n"
-        "}"
-    )
-    if old_unload not in t:
-        die("SDL_switchvideo.c: SWITCH_GL_UnloadLibrary not in expected form")
-    t = t.replace(old_unload, new_unload, 1)
-
-    old_destroy = (
-        "static bool SWITCH_GL_DestroyContext(SDL_VideoDevice *_this, SDL_GLContext context)\n"
-        "{\n"
-        "    SDL_VideoData *v = _this->internal;\n"
-        "    (void)context;\n"
-        "    if (v->display != EGL_NO_DISPLAY) {\n"
-        "        eglMakeCurrent(v->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);\n"
-        "        if (v->context != EGL_NO_CONTEXT) {\n"
-        "            eglDestroyContext(v->display, v->context);\n"
-        "            v->context = EGL_NO_CONTEXT;\n"
-        "        }\n"
-        "        if (v->surface != EGL_NO_SURFACE) {\n"
-        "            eglDestroySurface(v->display, v->surface);\n"
-        "            v->surface = EGL_NO_SURFACE;\n"
-        "        }\n"
-        "    }\n"
-        "    v->egl_initialized = false;\n"
-        "    return true;\n"
-        "}"
-    )
-    new_destroy = (
-        "static bool SWITCH_GL_DestroyContext(SDL_VideoDevice *_this, SDL_GLContext context)\n"
-        "{\n"
-        "    SDL_VideoData *v = _this->internal;\n"
-        "    (void)context;\n"
-        "    // Skip the mesa/nouveau EGL teardown (see SWITCH_GL_UnloadLibrary): it\n"
-        "    // can deadlock the GPU channel and hang the process on exit. Just drop\n"
-        "    // our handles; the kernel reclaims the GPU when the process terminates.\n"
-        "    v->context = EGL_NO_CONTEXT;\n"
-        "    v->surface = EGL_NO_SURFACE;\n"
-        "    v->egl_initialized = false;\n"
-        "    return true;\n"
-        "}"
-    )
-    if old_destroy not in t:
-        die("SDL_switchvideo.c: SWITCH_GL_DestroyContext not in expected form")
-    t = t.replace(old_destroy, new_destroy, 1)
-
-    video_path.write_text(t)
-    info("SDL_switchvideo.c: EGL teardown neutralized for clean Switch exit")
 
 
 def fix_nacp_version(taisei_root):
@@ -1225,83 +1236,6 @@ def write_clean_version(taisei_root):
     info(f".VERSION set to {want} (clean version label, no -dirty suffix)")
 
 
-def fix_gamepad_ab(sdl_root):
-    """The switch joystick backend maps face buttons positionally (Xbox style:
-    SDL a<-physical A). Nintendo's SDL convention is SDL SOUTH(a)=physical B,
-    EAST(b)=physical A, and Taisei's __SWITCH__ code assumes that. The mismatch
-    makes menus treat A as cancel / B as accept. Map like a real Nintendo pad."""
-    js = sdl_root / "src/joystick/switch/SDL_sysjoystick.c"
-    if not js.exists():
-        info("SDL_sysjoystick.c not found; skipping A/B fix"); return
-    t = js.read_text()
-    old = ("    out->a = (SDL_InputMapping){ EMappingKind_Button, 0 };\n"
-           "    out->b = (SDL_InputMapping){ EMappingKind_Button, 1 };\n"
-           "    out->x = (SDL_InputMapping){ EMappingKind_Button, 2 };\n"
-           "    out->y = (SDL_InputMapping){ EMappingKind_Button, 3 };\n")
-    new = ("    out->a = (SDL_InputMapping){ EMappingKind_Button, 1 };  // SDL SOUTH <- physical B\n"
-           "    out->b = (SDL_InputMapping){ EMappingKind_Button, 0 };  // SDL EAST  <- physical A\n"
-           "    out->x = (SDL_InputMapping){ EMappingKind_Button, 3 };  // SDL WEST  <- physical Y\n"
-           "    out->y = (SDL_InputMapping){ EMappingKind_Button, 2 };  // SDL NORTH <- physical X\n")
-    if new in t:
-        info("SDL_sysjoystick.c: A/B mapping already Nintendo-correct"); return
-    if old not in t:
-        info("SDL_sysjoystick.c: face-button mapping not in expected form; skipping"); return
-    js.write_text(t.replace(old, new, 1))
-    info("SDL_sysjoystick.c: face buttons remapped to Nintendo layout (A=accept, B=cancel)")
-
-
-def fix_audio_clean_exit(source_path):
-    """The audio thread blocks in audoutWaitPlayFinish(UINT64_MAX). At shutdown
-    ClosePhysicalAudioDevice() sets device->shutdown then SDL_WaitThread()s the
-    audio thread -- but a queued buffer may never be released once playback is
-    stopping, so the unbounded wait never returns, the join hangs, and the
-    system reports 'software closed because an error occurred'. Make the wait
-    finite + shutdown-aware so the thread can exit cleanly."""
-    t = source_path.read_text()
-    if "SDL_GetAtomicInt(&device->shutdown)" in t:
-        info("SDL_switchaudio.c: clean-exit wait already applied"); return
-    old = (
-        "    // Ring is full: block until the hardware frees a slot.\n"
-        "    if (R_FAILED(audoutWaitPlayFinish(&released, &released_count, UINT64_MAX))) {\n"
-        '        return SDL_SetError("audoutWaitPlayFinish() failed");\n'
-        "    }\n"
-        "    if (released_count > (u32)device->hidden->queued) {\n"
-        "        device->hidden->queued = 0;\n"
-        "    } else {\n"
-        "        device->hidden->queued -= (int)released_count;\n"
-        "    }\n"
-        "    return true;\n"
-        "}\n"
-    )
-    new = (
-        "    // Ring is full: block until the hardware frees a slot, but wake up\n"
-        "    // periodically so we can observe a shutdown request. A queued buffer\n"
-        "    // may never be released once playback is stopping at teardown, so an\n"
-        "    // unbounded wait here deadlocks the SDL_WaitThread() join in\n"
-        "    // ClosePhysicalAudioDevice() -- the app then hangs on exit and the\n"
-        '    // system reports "software closed because an error occurred".\n'
-        "    while (!SDL_GetAtomicInt(&device->shutdown)) {\n"
-        "        released = NULL;\n"
-        "        released_count = 0;\n"
-        "        if (R_SUCCEEDED(audoutWaitPlayFinish(&released, &released_count, 100000000ULL))) {\n"
-        "            if (released_count > (u32)device->hidden->queued) {\n"
-        "                device->hidden->queued = 0;\n"
-        "            } else {\n"
-        "                device->hidden->queued -= (int)released_count;\n"
-        "            }\n"
-        "            break;\n"
-        "        }\n"
-        "        // timed out with nothing released: loop and re-check shutdown\n"
-        "    }\n"
-        "    return true;\n"
-        "}\n"
-    )
-    if old not in t:
-        die("SDL_switchaudio.c: cushioned WaitDevice blocking tail not found (audio fix changed?)")
-    source_path.write_text(t.replace(old, new, 1))
-    info("SDL_switchaudio.c: finite, shutdown-aware audio wait (clean exit) applied")
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workdir", default="taisei-switch-build")
@@ -1328,39 +1262,39 @@ def main():
     portlibs = bash_capture('echo "$PORTLIBS_PREFIX"', dkp)
     info(f"portlibs prefix: {portlibs}")
 
-    # -- 1..3  patched SDL3 ---------------------------------------------------
+    # -- 1  devkitPro SDL3 (full libnx backend; no third-party backend patch) --
     sdl = work / "SDL"
     if not sdl.exists():
-        stage("cloning taisei SDL3 fork (taisei-3.4.10)")
+        stage("cloning devkitPro SDL3 (switch-sdl-3.4, SDL 3.4.0)")
         run(["git", "clone", "--depth", "1", "-b", SDL_BRANCH, SDL_REPO, str(sdl)])
+    else:
+        info("devkitPro SDL tree already present")
 
     video_c = sdl / "src/video/switch/SDL_switchvideo.c"
     if not video_c.exists():
-        stage("fetching + applying neomody77/sdl3-switch backend")
-        s3 = work / "sdl3-switch"
-        if not s3.exists():
-            run(["git", "clone", "--depth", "1", SDL3SWITCH, str(s3)])
-        # patch paths are a/external/SDL3/... -> strip 3 components
-        try:
-            run(["git", "apply", "-p3", str(s3 / "sdl3-switch.patch")], cwd=str(sdl))
-        except subprocess.CalledProcessError:
-            run(["patch", "-p3", "-i", str(s3 / "sdl3-switch.patch")], cwd=str(sdl))
-    else:
-        info("switch backend already present in SDL tree")
-
-    stage("adapting backend: GLES3 context + non-blocking cushioned audio queue")
-    adapt_video_gles3(video_c)
-    fix_video_clean_exit(video_c)
-    fix_audio_backend(
-        sdl / "src/audio/switch/SDL_switchaudio.h",
-        sdl / "src/audio/switch/SDL_switchaudio.c",
-    )
-    fix_audio_clean_exit(sdl / "src/audio/switch/SDL_switchaudio.c")
-    fix_gamepad_ab(sdl)
+        die("devkitPro SDL tree is missing src/video/switch/SDL_switchvideo.c "
+            "(wrong branch? expected switch-sdl-3.4)")
+    # devkitPro's Switch backend is used verbatim -- it already provides:
+    #   * GLES3 via SDL's core EGL path (honors Taisei's SDL_GL_SetAttribute)
+    #   * audren mixing audio (no BGM-glitch / clean-exit patch needed)
+    #   * Nintendo-swapped A/B face-button mapping
+    #   * `sdl_link_dependency(opengl LIBS EGL stdc++ glapi drm_nouveau)` in its
+    #     CMakeLists, which exports the mesa EGL deps through sdl3.pc so Taisei
+    #     resolves eglGetDisplay/etc automatically.
+    info("using devkitPro's native Switch backend as-is")
+    # The single SDL-side patch still required: give SDL_egl.h a __SWITCH__ case
+    # so Taisei's gles.c doesn't hit its "Platform not recognized" #error.
+    stage("patching SDL_egl.h for the Switch (native EGL types)")
     patch_sdl_egl_switch(sdl)
-    patch_sdl_cmake_egl_link(sdl)
+    # Replace audren with the libnx AUDOUT backend. audren's audio-thread work
+    # (per-callback update + IPC + render-frame waits) contends with Taisei's
+    # render thread on the Switch's shared cores and causes frame dips (seen in
+    # handheld, where GPU load matches the old build). AUDOUT hands PCM straight
+    # to the hardware sink -- the driver the flawless neomody77 build used.
+    stage("switching switch audio backend audren -> AUDOUT")
+    use_audout_audio_backend(sdl)
 
-    # -- 4  build + install SDL3 into portlibs --------------------------------
+    # -- 2  build + install SDL3 into portlibs --------------------------------
     stage("building SDL3 (static) for Switch and installing into portlibs")
     install_cmd = ("cmake --install build-switch"
                    if os.access(portlibs, os.W_OK)
@@ -1380,7 +1314,23 @@ def main():
         {install_cmd}
     """), devkitpro=dkp)
 
-    # -- 5  Taisei -------------------------------------------------------------
+    # verify the SDL install: sdl3.pc must exist and export the mesa EGL deps,
+    # or Taisei's final link fails with undefined eglGetDisplay/etc.
+    stage("verifying installed SDL3 (sdl3.pc + EGL export)")
+    pc = bash_capture('echo "$PORTLIBS_PREFIX/lib/pkgconfig/sdl3.pc"', dkp)
+    if not Path(pc).exists():
+        die(f"SDL install did not produce {pc} (build/install step failed?)")
+    pc_txt = Path(pc).read_text()
+    ver = bash_capture(f'grep -i "^Version:" "{pc}" || true', dkp)
+    info(f"installed {ver or 'sdl3 (version unknown)'}")
+    if "EGL" in pc_txt:
+        info("sdl3.pc exports EGL -> downstream link resolves mesa EGL")
+    else:
+        info("WARNING: sdl3.pc has no EGL in its link libs; if Taisei fails to "
+             "link with undefined eglGetDisplay, the crossfile EGL flags below "
+             "are the fallback for exactly that case.")
+
+    # -- 3  Taisei -------------------------------------------------------------
     taisei = work / "taisei"
     if not taisei.exists():
         stage(f"cloning Taisei {TAISEI_TAG} (recursive)")
@@ -1442,7 +1392,7 @@ def main():
         ninja -C build/nx install
     """), devkitpro=dkp)
 
-    # -- 6  collect ------------------------------------------------------------
+    # -- 4  collect ------------------------------------------------------------
     nro = taisei / "build/nx/src/taisei.nro"
     if not nro.exists():
         die("build finished but taisei.nro was not produced (check the log above)")
