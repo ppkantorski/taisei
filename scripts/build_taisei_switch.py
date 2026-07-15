@@ -71,7 +71,7 @@ Usage:
     DEVKITPRO=/opt/devkitpro is assumed; override with --devkitpro or $DEVKITPRO.
 """
 
-import argparse, os, re, shutil, subprocess, sys, textwrap
+import argparse, os, shutil, subprocess, sys, textwrap
 from pathlib import Path
 
 TAISEI_TAG  = "v1.4.5"
@@ -85,18 +85,18 @@ def stage(msg): print("\n" + c(">> " + msg, "1;36"), flush=True)
 def info(msg):  print(c("   " + msg, "0;37"), flush=True)
 def die(msg):   print(c("!! " + msg, "1;31"), file=sys.stderr); sys.exit(1)
 
-def run(cmd, cwd=None, env=None):
+def run(cmd):
     info("$ " + (cmd if isinstance(cmd, str) else " ".join(cmd)))
-    subprocess.run(cmd, cwd=cwd, env=env, shell=isinstance(cmd, str), check=True)
+    subprocess.run(cmd, shell=isinstance(cmd, str), check=True)
 
-def bash(script, cwd=None, devkitpro=None):
+def bash(script, devkitpro=None):
     """Run a bash snippet with devkitPro's Switch environment sourced."""
     env = dict(os.environ)
     if devkitpro:
         env["DEVKITPRO"] = devkitpro
     full = 'set -euo pipefail\nsource "$DEVKITPRO/switchvars.sh"\n' + script
     info("$ (switchvars) " + script.strip().splitlines()[0][:100])
-    subprocess.run(["/bin/bash", "-c", full], cwd=cwd, env=env, check=True)
+    subprocess.run(["/bin/bash", "-c", full], env=env, check=True)
 
 def bash_capture(script, devkitpro):
     env = dict(os.environ); env["DEVKITPRO"] = devkitpro
