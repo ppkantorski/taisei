@@ -3,17 +3,14 @@
 switch-build.py  —  one-shot Taisei (latest, v1.4.5) -> Switch .nro
                            built on devkitPro's SDL3 Switch backend.
 
-This script builds directly against devkitPro's own SDL3 Switch fork, rather
-than taking plain taisei-project/SDL and bolting a third-party Switch backend
-(such as neomody77/sdl3-switch) onto it and hand-patching that backend:
+This script builds directly against devkitPro's own SDL3 Switch fork:
 
     https://github.com/devkitPro/SDL/tree/switch-sdl-3.4   (SDL 3.4.0)
 
 That branch ships a complete, maintained libnx backend (video/audio/joystick/
-keyboard/mouse/touch/swkb/filesystem/power/time/timer), so almost none of the
-SDL-side patching that a bolted-on third-party backend would need applies
-here. Specifically, the following are already handled natively by devkitPro,
-so no patch is applied for them:
+keyboard/mouse/touch/swkb/filesystem/power/time/timer), so very little SDL-
+side patching is required. The following are already handled natively by
+devkitPro, so no patch is applied for them:
 
   * GLES3 context     -- devkitPro's video driver uses SDL's core EGL path
                          (SDL_EGL_CreateContext_impl / SDL_egl.c), which already
@@ -1264,7 +1261,7 @@ def main():
     portlibs = bash_capture('echo "$PORTLIBS_PREFIX"', dkp)
     info(f"portlibs prefix: {portlibs}")
 
-    # -- 1  devkitPro SDL3 (full libnx backend; no third-party backend patch) --
+    # -- 1  devkitPro SDL3 (full libnx backend) --------------------------------
     sdl = work / "SDL"
     if not sdl.exists():
         stage("cloning devkitPro SDL3 (switch-sdl-3.4, SDL 3.4.0)")
