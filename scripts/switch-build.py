@@ -69,6 +69,8 @@ It will:
 Usage:
     python3 switch-build.py [--workdir DIR] [--jobs N] [--clean]
     DEVKITPRO=/opt/devkitpro is assumed; override with --devkitpro or $DEVKITPRO.
+
+Copyright (C) 2026 ppkantorski <https://github.com/ppkantorski>
 """
 
 import argparse, os, shutil, subprocess, sys, textwrap
