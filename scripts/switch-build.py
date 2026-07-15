@@ -37,20 +37,20 @@ is built:
                     Its audio-thread work (per-callback update + IPC + render-
                     frame waits) contends with Taisei's render thread on the
                     Switch's shared cores and causes frame dips, most visible
-                    in handheld mode where the CPU/GPU budget is tightest. We
-                    replace it with the libnx AUDOUT backend (see
+                    in handheld mode where the CPU/GPU budget is tightest. It
+                    is replaced with the libnx AUDOUT backend (see
                     use_audout_audio_backend) -- PCM straight to the hardware
                     sink, with a 4-buffer cushion + shutdown-aware wait so
                     there is no BGM glitch.
 
 On SDL_egl.h specifically: devkitPro's copy has
 no __SWITCH__ branch in its EGL native-type block, so when Taisei's gles.c includes
-<SDL3/SDL_egl.h> it falls through to `#error "Platform not recognized"`. We add a
-Switch branch (see patch_sdl_egl_switch) before building SDL.
+<SDL3/SDL_egl.h> it falls through to `#error "Platform not recognized"`. A
+Switch branch is added (see patch_sdl_egl_switch) before building SDL.
 
 Everything on the *Taisei* side (wallpaper feature + fixes, VFS strfmt/mmap
-bitrot, clean version label, NACP version) is game-side and independent of which
-SDL we use, so it is kept verbatim.
+bitrot, clean version label, NACP version) is game-side and independent of
+which SDL backend is used, so it is applied verbatim regardless of source.
 
 Run this in an empty folder on a Mac/Linux box that already has devkitPro at
 /opt/devkitpro with the Switch portlibs installed (mesa, freetype, libpng, webp,
@@ -449,11 +449,12 @@ def use_audout_audio_backend(sdl_root):
 
 
 def fix_wallpaper_draw(taisei_root):
-    """The wallpaper quad was culled: draw_framebuffer_attachment() (which works
-    in the same spot) explicitly sets r_cull(CULL_BACK), but our draw ran before
-    that with whatever cull state the 3D/postprocess left (often CULL_FRONT), so
-    the quad got culled away. Set CULL_BACK for our draw (and restore whatever
-    cull mode was active before, rather than clobbering it for later draws)."""
+    """The wallpaper quad was being culled. draw_framebuffer_attachment(), which
+    renders to the same target, explicitly sets r_cull(CULL_BACK); the wallpaper
+    draw did not, so it inherited whatever cull state the 3D/postprocess pass
+    left active (often CULL_FRONT), which culled the quad away. Explicitly set
+    CULL_BACK for the wallpaper draw, and restore the previous cull mode
+    afterward so later draws in the frame are unaffected."""
     v = taisei_root / "src/video.c"
     if not v.exists():
         return
@@ -729,18 +730,18 @@ def fix_wallpaper_pixel_format(taisei_root):
 
 
 def fix_wallpaper_blend(taisei_root):
-    """nx_wallpaper_draw() saves/restores shader, color, cull mode, framebuffer and
-    scissor via r_state_push()/r_state_pop() -- but per Taisei's own
-    renderer/common/state.c, that stack only restores whatever was actually
-    *touched* between push and pop (a dirty-bit system, not a full snapshot).
-    We never call r_blend(), so the draw runs with whatever blend mode was left
-    over from the previous draw call that frame (almost certainly BLEND_ALPHA
-    somewhere in Taisei's own rendering). If wallpaper.png has any real alpha in
-    it -- transparent padding if the art doesn't fill the full canvas, a
-    dither/pattern with partial alpha, anti-aliased edges, etc -- those pixels
-    blend toward the black clear color instead of showing their real RGB. That
-    reads exactly as scattered missing pixels and a black region at the bottom.
-    Force BLEND_NONE so the wallpaper always draws fully opaque."""
+    """nx_wallpaper_draw() saves and restores shader, color, cull mode,
+    framebuffer, and scissor state via r_state_push()/r_state_pop(), but per
+    Taisei's renderer/common/state.c, that stack only restores whatever was
+    actually *touched* between push and pop -- a dirty-bit system, not a full
+    snapshot. The draw never calls r_blend(), so it runs with whatever blend
+    mode the previous draw call left active (typically BLEND_ALPHA, set
+    elsewhere in Taisei's rendering). If wallpaper.png has any alpha channel
+    data -- transparent padding around the art, a dithered pattern, anti-
+    aliased edges -- those pixels blend toward the black clear color instead
+    of showing their actual RGB, which appears as missing pixels and black
+    patches in the rendered image. Force BLEND_NONE so the wallpaper always
+    renders fully opaque."""
     v = taisei_root / "src/video.c"
     if not v.exists():
         return
@@ -768,25 +769,24 @@ def fix_wallpaper_blend(taisei_root):
 
 
 def fix_wallpaper_frame_start(taisei_root):
-    """Architectural fix for the settings-menu text going missing whenever the
-    wallpaper is on. nx_wallpaper_draw() was called at the very END of the
-    frame -- inside video_swap_buffers(), right before the buffer flip -- which
-    means it painted an *opaque* quad over the bars after everything else that
-    frame (game, UI, menus) had already been drawn to the screen framebuffer.
-    That's backwards for something meant to be a background: if any menu/UI
-    element extends into the pillarbox bars, our end-of-frame overpaint just
-    silently erases it. That's almost certainly the missing-text bug -- and
-    it's a real risk for any other UI screen too, not just settings.
+    """Moves the wallpaper draw to the start of the frame instead of the end.
+    nx_wallpaper_draw() was previously called at the very end of the frame,
+    inside video_swap_buffers() right before the buffer flip -- meaning it
+    painted an opaque quad over the pillarbox bars after the game, UI, and
+    menus had already been drawn to the screen framebuffer. That ordering is
+    wrong for a background layer: any UI element that extends into the bars
+    (the settings menu, for example) gets silently painted over and hidden.
 
     Taisei's actual per-frame entry point is run_render_frame() in
     src/eventloop/eventloop.c: it clears the screen to black, then calls
-    frame->render() to draw that frame's content. Moving our draw to right
-    after that clear (before frame->render()) makes the wallpaper a genuine
-    background -- everything drawn afterwards layers on top of it normally,
-    so it can never occlude anything, regardless of what draws where. This
-    also removes the need for two separate, awkward call sites inside
-    video_swap_buffers() (one per postprocess / no-postprocess branch): one
-    unconditional call, once a frame, before any content exists to hide."""
+    frame->render() to draw that frame's content. Moving the wallpaper draw
+    to right after that clear -- before frame->render() -- makes it a
+    genuine background: everything drawn afterward layers on top of it
+    normally, so it can never occlude UI content regardless of what draws
+    where. This also replaces the two separate call sites inside
+    video_swap_buffers() (one per postprocess / no-postprocess branch) with
+    a single unconditional call, once per frame, before any content exists
+    to hide."""
     v = taisei_root / "src/video.c"
     h = taisei_root / "src/video.h"
     e = taisei_root / "src/eventloop/eventloop.c"
@@ -881,9 +881,9 @@ def fix_wallpaper_frame_start(taisei_root):
 
 
 def fix_wallpaper_v2(taisei_root):
-    """Robust wallpaper load. Reads wallpaper.png with plain fopen/fread (the
-    same newlib path the VFS already uses for data/) instead of SDL_IOFromFile,
-    which proved unreliable for this file."""
+    """Reads wallpaper.png with plain fopen/fread -- the same newlib path the
+    VFS already uses for data/ -- instead of SDL_IOFromFile, which does not
+    reliably read this file on the Switch."""
     v = taisei_root / "src/video.c"
     if not v.exists():
         return
@@ -1226,8 +1226,9 @@ def fix_nacp_version(taisei_root):
 
 
 def write_clean_version(taisei_root):
-    """version.py runs `git describe --dirty`; because we patch the tree it
-    yields e.g. 'v1.4.5-dirty-<branch>'. A .VERSION override file (checked
+    """version.py runs `git describe --dirty`; since this script modifies the
+    source tree before building, that yields e.g. 'v1.4.5-dirty-<branch>'
+    instead of a clean version string. A .VERSION override file (checked
     before git) pins a clean label."""
     vf = taisei_root / ".VERSION"
     want = TAISEI_TAG  # e.g. "v1.4.5"
