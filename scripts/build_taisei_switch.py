@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
 build_taisei_switch.py  —  one-shot Taisei (latest, v1.4.5) -> Switch .nro
-                           built on devkitPro's *own* SDL3 Switch backend.
+                           built on devkitPro's SDL3 Switch backend.
 
-This is the devkitPro variant of the build script. Instead of taking plain
-taisei-project/SDL and bolting neomody77/sdl3-switch's backend onto it (then
-heavily patching that backend), it builds directly against devkitPro's SDL fork:
+This script builds directly against devkitPro's own SDL3 Switch fork, rather
+than taking plain taisei-project/SDL and bolting a third-party Switch backend
+(such as neomody77/sdl3-switch) onto it and hand-patching that backend:
 
     https://github.com/devkitPro/SDL/tree/switch-sdl-3.4   (SDL 3.4.0)
 
 That branch ships a complete, maintained libnx backend (video/audio/joystick/
 keyboard/mouse/touch/swkb/filesystem/power/time/timer), so almost none of the
-SDL-side patching the neomody77 build needed applies here. Specifically, the
-following are ALREADY handled natively by devkitPro and were therefore removed:
+SDL-side patching that a bolted-on third-party backend would need applies
+here. Specifically, the following are already handled natively by devkitPro,
+so no patch is applied for them:
 
   * GLES3 context     -- devkitPro's video driver uses SDL's core EGL path
                          (SDL_EGL_CreateContext_impl / SDL_egl.c), which already
@@ -35,12 +36,12 @@ is built:
   * audio driver -- devkitPro drives audio through audren (a software mixer).
                     Its audio-thread work (per-callback update + IPC + render-
                     frame waits) contends with Taisei's render thread on the
-                    Switch's shared cores and causes frame dips (visible in
-                    handheld, where GPU load matches the old build). We replace
-                    it with the libnx AUDOUT backend (see use_audout_audio_-
-                    backend) -- PCM straight to the hardware sink, the driver the
-                    flawless neomody77 build used -- carrying the proven 4-buffer
-                    cushion + shutdown-aware wait so there is no BGM glitch.
+                    Switch's shared cores and causes frame dips, most visible
+                    in handheld mode where the CPU/GPU budget is tightest. We
+                    replace it with the libnx AUDOUT backend (see
+                    use_audout_audio_backend) -- PCM straight to the hardware
+                    sink, with a 4-buffer cushion + shutdown-aware wait so
+                    there is no BGM glitch.
 
 On SDL_egl.h specifically: devkitPro's copy has
 no __SWITCH__ branch in its EGL native-type block, so when Taisei's gles.c includes
@@ -66,7 +67,7 @@ It will:
   6. drop the finished taisei.nro (+ SD-card layout) in ./dist/
 
 Usage:
-    python3 build_taisei_switch_devkitpro.py [--workdir DIR] [--jobs N] [--clean]
+    python3 build_taisei_switch.py [--workdir DIR] [--jobs N] [--clean]
     DEVKITPRO=/opt/devkitpro is assumed; override with --devkitpro or $DEVKITPRO.
 """
 
@@ -424,19 +425,18 @@ def use_audout_audio_backend(sdl_root):
     devkitPro drives audio through audren (a software mixer whose SDL glue runs
     an extra per-callback update/IPC and waits on its own render frames). On the
     Switch's shared cores that audio-thread work periodically contends with
-    Taisei's render thread and shows up as frame dips (most visible in handheld,
-    where the GPU load is otherwise identical to the old build). AUDOUT instead
-    hands PCM straight to the hardware sink with almost no game-side threading --
-    the same driver the neomody77 build used, which profiled cleanly.
+    Taisei's render thread and shows up as frame dips, most visible in handheld
+    mode where the CPU/GPU budget is tightest. AUDOUT instead hands PCM straight
+    to the hardware sink with almost no game-side threading.
 
     We overwrite src/audio/switch/SDL_switchaudio.{c,h} with the AUDOUT backend
-    (same file names, same SWITCHAUDIO_bootstrap symbol and \"switch\" driver
+    (same file names, same SWITCHAUDIO_bootstrap symbol and "switch" driver
     name, so devkitPro's CMake picks it up with no build changes; audout lives
-    in libnx, already linked via -lnx). The embedded backend already carries the
-    proven fixes from the flawless build: a 4-deep buffer ring with a
-    non-blocking drain in WaitDevice() (so the mixer keeps a cushion instead of
-    re-synchronizing every buffer -> no BGM glitch), and a finite, shutdown-
-    aware wait (so the audio thread can't deadlock the shutdown join)."""
+    in libnx, already linked via -lnx). The embedded backend uses a 4-deep
+    buffer ring with a non-blocking drain in WaitDevice() (so the mixer keeps a
+    cushion instead of re-synchronizing every buffer -> no BGM glitch), and a
+    finite, shutdown-aware wait (so the audio thread can't deadlock the
+    shutdown join)."""
     adir = sdl_root / "src/audio/switch"
     if not adir.exists():
         die("SDL audio/switch dir not found; cannot install AUDOUT backend")
@@ -545,7 +545,6 @@ def fix_wallpaper_no_postprocess(taisei_root):
     this Switch build that shader isn't present, so video.postprocess is NULL,
     pp_fb is always NULL, and video_swap_buffers() always takes the `else` branch
     (just r_swap(video.window)) -- meaning nx_wallpaper_draw() never ran, ever.
-    The debug log confirms this: the one-time "draw:" line never got written.
 
     The fix has two parts:
       1. Make nx_wallpaper_draw() fully self-contained. It used to rely on its
@@ -933,7 +932,7 @@ def fix_wallpaper_v2(taisei_root):
         info("video.c: v1 wallpaper loader not found; skipping v2"); return
     t = t.replace(old, new, 1)
     v.write_text(t)
-    info("video.c: wallpaper loader -> fopen/fread (no more debug log)")
+    info("video.c: wallpaper loader -> fopen/fread (avoids SDL_IOFromFile)")
 
 
 def fix_wallpaper_loader(taisei_root):
@@ -1276,7 +1275,8 @@ def main():
             "(wrong branch? expected switch-sdl-3.4)")
     # devkitPro's Switch backend is used verbatim -- it already provides:
     #   * GLES3 via SDL's core EGL path (honors Taisei's SDL_GL_SetAttribute)
-    #   * audren mixing audio (no BGM-glitch / clean-exit patch needed)
+    #   * a clean, non-blocking audio-device teardown (WaitDevice() returns
+    #     promptly, so no shutdown patch is needed)
     #   * Nintendo-swapped A/B face-button mapping
     #   * `sdl_link_dependency(opengl LIBS EGL stdc++ glapi drm_nouveau)` in its
     #     CMakeLists, which exports the mesa EGL deps through sdl3.pc so Taisei
@@ -1288,9 +1288,9 @@ def main():
     patch_sdl_egl_switch(sdl)
     # Replace audren with the libnx AUDOUT backend. audren's audio-thread work
     # (per-callback update + IPC + render-frame waits) contends with Taisei's
-    # render thread on the Switch's shared cores and causes frame dips (seen in
-    # handheld, where GPU load matches the old build). AUDOUT hands PCM straight
-    # to the hardware sink -- the driver the flawless neomody77 build used.
+    # render thread on the Switch's shared cores and causes frame dips, most
+    # visible in handheld mode where the CPU/GPU budget is tightest. AUDOUT
+    # hands PCM straight to the hardware sink instead.
     stage("switching switch audio backend audren -> AUDOUT")
     use_audout_audio_backend(sdl)
 
