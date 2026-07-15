@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_taisei_switch.py  —  one-shot Taisei (latest, v1.4.5) -> Switch .nro
+switch-build.py  —  one-shot Taisei (latest, v1.4.5) -> Switch .nro
                            built on devkitPro's SDL3 Switch backend.
 
 This script builds directly against devkitPro's own SDL3 Switch fork, rather
@@ -67,7 +67,7 @@ It will:
   6. drop the finished taisei.nro (+ SD-card layout) in ./dist/
 
 Usage:
-    python3 build_taisei_switch.py [--workdir DIR] [--jobs N] [--clean]
+    python3 switch-build.py [--workdir DIR] [--jobs N] [--clean]
     DEVKITPRO=/opt/devkitpro is assumed; override with --devkitpro or $DEVKITPRO.
 """
 
